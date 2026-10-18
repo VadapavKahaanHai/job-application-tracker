@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Daily job refresh for Job_Tracker_Mumbai_Java.xlsx
+Werkstudent data-role refresh for Werkstudent_Job_Tracker.xlsx.
 
 Priority order in the sheet:
-  1 Mumbai / Navi Mumbai / Thane / Remote
+  1 Requested German cities
   2 Verify location (search result didn't show a city)
   3 Other cities
 Within each group: High fit first, then newest posting first.
 
 What a run does
-  1. Runs Firecrawl searches (LinkedIn, Naukri, web), limited to the past week.
-  2. Drops WITCH companies (Wipro, Infosys, TCS, Cognizant, HCL), junior/too-senior
-     roles, and anything it can see is older than 7 days.
+  1. Searches and requests page content through Firecrawl for LinkedIn,
+     Hiring Cafe, XING and StepStone, limited to the past week.
+  2. Keeps student data roles in the requested cities, excluding known old jobs.
+     Queries and skill matches are fixed from the resume; no resume is read.
   3. Adds only NEW jobs (deduplicated by link), then re-sorts the whole Jobs sheet.
      Your Status / Date Applied / Notes / Fit edits are preserved.
 
@@ -24,50 +25,62 @@ import os
 import re
 import sys
 from datetime import date, datetime, timedelta
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import requests
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 
 API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
-TRACKER_PATH = os.environ.get("TRACKER_PATH", "Job_Tracker_Mumbai_Java.xlsx")
+TRACKER_PATH = os.environ.get("TRACKER_PATH", "Werkstudent_Job_Tracker.xlsx")
 SEARCH_URL = "https://api.firecrawl.dev/v2/search"
 MAX_AGE_DAYS = 7
-MAX_MIN_EXPERIENCE = 7   # skip roles whose minimum experience is above this
-MIN_MAX_EXPERIENCE = 3   # skip roles whose maximum experience is below this
-
-# (query, location bias). Group 1 = Mumbai + remote, group 2 = other cities.
-QUERIES = [
-    ("site:linkedin.com/jobs Java Spring Boot backend engineer Mumbai", "Mumbai, India"),
-    ("site:linkedin.com/jobs Java Kafka microservices engineer Mumbai", "Mumbai, India"),
-    ("site:linkedin.com/jobs Software Engineer II OR III OR SDE 2 Java Mumbai", "Mumbai, India"),
-    ("site:naukri.com Java Spring Boot developer Mumbai 4 to 8 years", "Mumbai, India"),
-    ("site:naukri.com Java backend Kafka microservices Mumbai", "Mumbai, India"),
-    ("SDE 2 backend Java Spring Boot Kafka Mumbai fintech product company", "Mumbai, India"),
-    ("site:linkedin.com/jobs Java Spring Boot backend engineer remote India", "India"),
-    ("site:naukri.com Java Spring Boot developer work from home remote 4 to 8 years", "India"),
-    ("site:linkedin.com/jobs Java Spring Boot Kafka backend engineer Pune OR Bengaluru OR Hyderabad", "India"),
-    ("site:naukri.com Java Spring Boot Kafka 4 to 8 years Pune Bengaluru Hyderabad", "India"),
-]
-
-WITCH = re.compile(
-    r"\b(wipro|infosys|tata consultancy|tcs|cognizant|hcl|hcltech|hcl technologies)\b"
-)
-NOT_RELEVANT_TITLE = re.compile(
-    r"\b(intern|internship|fresher|freshers|trainee|junior|principal|architect|"
-    r"director|manager|vp|vice president)\b"
-)
-MUST_MATCH = re.compile(r"\b(java|spring|backend|back end|sde|software engineer)\b")
-MUMBAI = re.compile(r"\b(mumbai|navi mumbai|thane|bombay)\b")
-REMOTE = re.compile(r"\b(remote|work from home|wfh)\b")
 CITIES = {
-    "bengaluru": "Bengaluru", "bangalore": "Bengaluru", "pune": "Pune",
-    "hyderabad": "Hyderabad", "chennai": "Chennai", "gurgaon": "Gurugram",
-    "gurugram": "Gurugram", "noida": "Noida", "delhi": "Delhi", "kolkata": "Kolkata",
-    "ahmedabad": "Ahmedabad", "kochi": "Kochi", "indore": "Indore", "jaipur": "Jaipur",
-    "coimbatore": "Coimbatore", "nagpur": "Nagpur", "vadodara": "Vadodara",
-    "chandigarh": "Chandigarh", "trivandrum": "Trivandrum", "bhubaneswar": "Bhubaneswar",
+    "düsseldorf": "Düsseldorf", "duesseldorf": "Düsseldorf", "dusseldorf": "Düsseldorf",
+    "köln": "Köln", "koeln": "Köln", "koln": "Köln", "cologne": "Köln",
+    "hannover": "Hannover", "hanover": "Hannover", "hamburg": "Hamburg",
+    "aachen": "Aachen", "münchen": "München", "muenchen": "München",
+    "munich": "München", "frankfurt": "Frankfurt am Main",
 }
+TARGET_CITIES = tuple(dict.fromkeys(CITIES.values()))
+SITES = (
+    "site:linkedin.com/jobs/view",
+    "(site:hiring.cafe/viewjob OR site:hiringcafe.com/viewjob)",
+    "site:xing.com/jobs",
+    "site:stepstone.de/stellenangebote",
+)
+# Fixed from the resume's analytics, reporting and pipeline experience.
+ROLE_QUERIES = (
+    '("Data Analyst" OR "Data Analysis" OR "Data Analytics" OR Datenanalyse) '
+    '(Python OR SQL OR R OR Excel OR Revenue OR Marketing)',
+    '("Business Intelligence" OR "Power BI" OR Reporting) '
+    '(SQL OR "Power BI" OR Excel OR KPI)',
+    '("Data Engineering" OR "Data Engineer" OR Datenengineering) '
+    '(Python OR SQL OR PySpark OR ETL OR PostgreSQL OR AWS)',
+)
+QUERIES = [
+    (f'{site} (Werkstudent OR Werkstudentin OR "Working Student") {role} "{city}"',
+     f"{city}, Germany")
+    for city in TARGET_CITIES for site in SITES for role in ROLE_QUERIES
+]
+STUDENT = re.compile(r"\b(werkstudent\w*|working\s+student|student\s+(?:employee|assistant))\b")
+NOT_RELEVANT_TITLE = re.compile(
+    r"\b(senior|principal|architect|director|head of|lead|vp|vice president)\b"
+)
+MUST_MATCH = re.compile(
+    r"\b(data\s+(?:analyst\w*|analys\w*|analytics|engineer\w*)|datenanalys\w*|"
+    r"datenengineering|business intelligence|bi|power\s*bi|reporting)\b"
+)
+RESUME_SKILLS = (
+    r"python", r"sql", r"r", r"pyspark", r"pandas", r"postgresql", r"duckdb",
+    r"etl|elt", r"data pipelines?|datenpipelines?", r"data warehous\w*", r"aws",
+    r"power\s*bi", r"excel", r"kpi\w*", r"data validation|datenvalidierung",
+)
+GERMAN_ABOVE_B1 = re.compile(
+    r"(?:deutsch|german)[^\n.!?]{0,50}\b(?:b2|c1|c2|fluent|native)\b|"
+    r"\b(?:b2|c1|c2|fluent|native)[^\n.!?]{0,50}(?:deutsch|german)|"
+    r"(?:fließend\w*|fliessend\w*|verhandlungssicher\w*|sehr gut\w*)\s+deutsch"
+)
 
 # ---------- sheet layout (shared with the tracker file) ----------
 HEADERS = ["#", "Priority", "Company", "Role", "Location", "Experience", "Source",
@@ -83,11 +96,12 @@ FIT_RANK = {"High": 0, "Medium": 1, "Low": 2}
 
 # ---------- helpers ----------
 def norm(text):
-    return re.sub(r"[-_/]+", " ", (text or "").lower())
+    return re.sub(r"[-_/]+", " ", unquote(text or "").lower())
 
 
 def clean_url(url):
-    return url.split("?")[0].rstrip("/")
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
 
 
 def to_date(v):
@@ -97,39 +111,57 @@ def to_date(v):
 
 
 def source_of(url):
-    if "linkedin.com" in url:
-        return "LinkedIn"
-    if "naukri.com" in url:
-        return "Naukri"
+    host = urlsplit(url).hostname or ""
+    for domain, source in (("linkedin.com", "LinkedIn"), ("hiring.cafe", "Hiring Cafe"),
+                           ("hiringcafe.com", "Hiring Cafe"), ("xing.com", "XING"),
+                           ("stepstone.de", "StepStone")):
+        if host == domain or host.endswith("." + domain):
+            return source
     return "Other"
+
+
+def is_job_url(url):
+    if urlsplit(url).scheme not in ("http", "https"):
+        return False
+    patterns = {
+        "LinkedIn": r"^/jobs/view/[^/]+$",
+        "Hiring Cafe": r"^/viewjob/[^/]+$",
+        "XING": r"^/jobs/[^/]+-\d+$",
+        "StepStone": r"^/stellenangebote--.+--\d+[^/]*\.html$",
+    }
+    return bool(re.search(patterns.get(source_of(url), r"(?!)"), urlsplit(url).path, re.I))
 
 
 def posted_date(title, desc, url, today):
     """Best-effort posting date; None if unknown."""
     text = f"{title} {desc}".lower()
-    m = re.search(r"(\d+)\s*(hour|hr|minute|min|day|week)s?\s+ago", text)
+    m = re.search(r"(\d+)\s*(hour|hr|minute|min|day|week|month|year)s?\s+ago", text)
     if m:
         n, unit = int(m.group(1)), m.group(2)
         if unit in ("hour", "hr", "minute", "min"):
             return today
-        return today - timedelta(days=n if unit == "day" else 7 * n)
-    # Naukri job ids end with DDMMYY + digits, e.g. ...-121026002418 -> 12 Oct 2026
-    m = re.search(r"-(\d{2})(\d{2})(\d{2})\d{4,7}$", url.split("?")[0])
-    if "naukri.com" in url and m:
-        try:
-            return date(2000 + int(m.group(3)), int(m.group(2)), int(m.group(1)))
-        except ValueError:
-            return None
+        return today - timedelta(days=n * {"day": 1, "week": 7, "month": 30, "year": 365}[unit])
+    m = re.search(r"vor\s+(\d+)\s*(minute\w*|stunde\w*|tag\w*|woche\w*|monat\w*|jahr\w*)", text)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        days = n * next((factor for prefix, factor in
+                         (("tag", 1), ("woche", 7), ("monat", 30), ("jahr", 365))
+                         if unit.startswith(prefix)), 0)
+        return today - timedelta(days=days)
+    if re.search(r"\b(gestern|yesterday)\b", text):
+        return today - timedelta(days=1)
+    if re.search(r"\b(heute|today|just posted)\b", text):
+        return today
     return None
 
 
 def parse_experience(title, desc, url):
     """Returns (lo, hi) years, (lo, None) for 'N+', or None."""
     raw = f"{title} {desc} {url.replace('-', ' ')}".lower()
-    m = re.search(r"\b(\d{1,2})\s*(?:to|-|–)\s*(\d{1,2})\s*\+?\s*(?:yrs|years|yr)\b", raw)
+    m = re.search(r"\b(\d{1,2})\s*(?:to|bis|-|–)\s*(\d{1,2})\s*\+?\s*(?:yrs|years|yr|jahre[n]?)\b", raw)
     if m:
         return int(m.group(1)), int(m.group(2))
-    m = re.search(r"\b(\d{1,2})\s*\+\s*(?:yrs|years|yr)\b", raw)
+    m = re.search(r"\b(\d{1,2})\s*\+\s*(?:yrs|years|yr|jahre[n]?)\b", raw)
     if m:
         return int(m.group(1)), None
     return None
@@ -143,12 +175,9 @@ def exp_label(exp):
 
 
 def classify_location(title, url, desc):
-    """Mumbai / Remote / city name(s) / Verify. Title+URL are trusted before the snippet."""
+    """Require an explicit target city; a search location bias is not evidence."""
     for text in (norm(f"{title} {url}"), norm(desc)):
-        if MUMBAI.search(text):
-            return "Mumbai"
-        if REMOTE.search(text):
-            return "Remote"
+        text = re.sub(r"\bfrankfurt\s+(?:(?:an\s+der|am)\s+)?oder\b", "", text)
         found = sorted({v for k, v in CITIES.items() if re.search(rf"\b{k}\b", text)})
         if found:
             return " / ".join(found)
@@ -156,9 +185,9 @@ def classify_location(title, url, desc):
 
 
 def tier(location):
-    """1 = Mumbai/Remote, 2 = unknown, 3 = other city. Mirrors the Priority formula."""
+    """1 = requested cities, 2 = unknown, 3 = other city."""
     loc = (location or "").lower()
-    if any(k in loc for k in ("mumbai", "thane", "remote")):
+    if any(re.search(rf"\b{k}\b", loc) for k in CITIES):
         return 1
     if loc in ("", "verify"):
         return 2
@@ -174,15 +203,15 @@ def guess_company_role(title):
     m = re.match(r"(.+?)\s+at\s+(.+?)(?:\s+[-—–]\s+.*)?$", t, re.I)
     if m:
         return m.group(2).strip(), m.group(1).strip()
-    m = re.match(r"(.+?)\s+[-–]\s+(.+?)\s+-\s+\d+", t)  # Naukri style
-    if m:
-        return m.group(2).strip(), m.group(1).strip()
     return "See link", t
 
 
 def fit_of(text):
     t = text.lower()
-    return "High" if ("kafka" in t and "spring" in t) else "Medium"
+    if GERMAN_ABOVE_B1.search(t):
+        return "Low"
+    matches = sum(bool(re.search(rf"\b(?:{skill})\b", t)) for skill in RESUME_SKILLS)
+    return "High" if matches >= 2 else "Medium"
 
 
 # ---------- search ----------
@@ -191,11 +220,15 @@ def run_search(query, location):
         SEARCH_URL,
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
         json={"query": query, "limit": 20, "sources": ["web"], "tbs": "qdr:w",
-              "location": location},
+              "location": location, "country": "DE",
+              "scrapeOptions": {"formats": [{"type": "markdown"}]}},
         timeout=90,
     )
     resp.raise_for_status()
-    data = resp.json().get("data", {})
+    payload = resp.json()
+    if payload.get("success") is False:
+        raise RuntimeError("Firecrawl reported an unsuccessful search")
+    data = payload.get("data", {})
     return data.get("web", []) if isinstance(data, dict) else data
 
 
@@ -206,35 +239,40 @@ def process_results(results, seen_links, today):
         url = clean_url(r.get("url", ""))
         title = r.get("title", "") or ""
         desc = r.get("description", "") or r.get("snippet", "") or ""
-        blob = norm(f"{title} {desc} {url}")
+        content = r.get("markdown", "") or ""
+        blob = norm(f"{title} {desc} {content} {url}")
 
         if not url or url in seen_links:
             continue
-        if source_of(url) != "Other" and "/jobs/view/" not in url and "job-listings" not in url:
+        if not is_job_url(url):
             continue  # category / company pages
-        if WITCH.search(blob) or NOT_RELEVANT_TITLE.search(norm(title)):
+        if NOT_RELEVANT_TITLE.search(norm(title)) or not STUDENT.search(norm(title)):
             continue
-        if not MUST_MATCH.search(blob):
+        if not MUST_MATCH.search(norm(title)):
+            continue
+
+        # shortcut: location is text-based; use structured job metadata if false matches appear.
+        location = classify_location(title, url, f"{desc}\n{content}")
+        if location == "Verify":
             continue
 
         posted = posted_date(title, desc, url, today)
         if posted and (today - posted).days > MAX_AGE_DAYS:
             continue
-        if source_of(url) == "Other" and posted is None:
-            continue
-
         exp = parse_experience(title, desc, url)
-        if exp:
-            lo, hi = exp
-            if lo > MAX_MIN_EXPERIENCE or (hi is not None and hi < MIN_MAX_EXPERIENCE):
-                continue
-
+        notes = ["Auto-added; verify company, location and requirements"]
+        if not posted:
+            notes.append("posting date unknown")
+        if not content:
+            notes.append("page content unavailable; matched search snippet only")
+        if GERMAN_ABOVE_B1.search(blob):
+            notes.append("check German requirement against B1")
         company, role = guess_company_role(title)
         out.append(dict(
-            company=company, role=role, location=classify_location(title, url, desc),
+            company=company, role=role, location=location,
             exp=exp_label(exp), source=source_of(url), posted=posted, fit=fit_of(blob),
             status="Not applied", applied=None, link=url, found=today,
-            note="Auto-added; check company/location" + ("" if posted else "; posting date unknown"),
+            note="; ".join(notes),
         ))
         seen_links.add(url)
     return out
@@ -254,7 +292,8 @@ def read_records(ws):
             posted=to_date(ws.cell(r, COL_POSTED).value), fit=ws.cell(r, COL_FIT).value,
             status=ws.cell(r, COL_STATUS).value or "Not applied",
             applied=to_date(ws.cell(r, COL_APPLIED).value),
-            link=clean_url(link_cell.hyperlink.target) if link_cell.hyperlink else "",
+            link=clean_url(link_cell.hyperlink.target) if link_cell.hyperlink else
+                 clean_url(link_cell.value) if str(link_cell.value).startswith(("https://", "http://")) else "",
             note=ws.cell(r, COL_NOTE).value, found=to_date(ws.cell(r, COL_FOUND).value),
         ))
     return recs
@@ -293,10 +332,10 @@ def write_records(ws, recs):
             cell.value = None
     for i, rec in enumerate(recs, start=2):
         style_row(ws, i)
+        city_checks = ",".join(f'ISNUMBER(SEARCH("{city}",E{i}))' for city in CITIES)
         vals = {
             COL_NUM: i - 1,
-            COL_PRI: (f'=IF(OR(ISNUMBER(SEARCH("mumbai",E{i})),ISNUMBER(SEARCH("thane",E{i})),'
-                      f'ISNUMBER(SEARCH("remote",E{i}))),"1 Mumbai/Remote",'
+            COL_PRI: (f'=IF(OR({city_checks}),"1 Target city",'
                       f'IF(OR(E{i}="",E{i}="Verify"),"2 Verify location","3 Other city"))'),
             COL_COMP: rec["company"], COL_ROLE: rec["role"], COL_LOC: rec["location"],
             COL_EXP: rec["exp"] or "Not stated", COL_SRC: rec["source"],
@@ -306,6 +345,8 @@ def write_records(ws, recs):
         }
         for c, v in vals.items():
             ws.cell(i, c).value = v
+            if isinstance(v, str) and c not in (COL_PRI, COL_AGE):
+                ws.cell(i, c).data_type = "s"  # Job text must never become an Excel formula.
         if rec["link"]:
             link = ws.cell(i, COL_LINK)
             link.hyperlink = rec["link"]
@@ -321,21 +362,34 @@ def main():
     wb = load_workbook(TRACKER_PATH)
     ws = wb["Jobs"]
     if ws.cell(1, COL_PRI).value != "Priority":
-        sys.exit("Tracker layout is outdated - use the latest Job_Tracker_Mumbai_Java.xlsx.")
+        sys.exit("Tracker layout is outdated - use Werkstudent_Job_Tracker.xlsx.")
     recs = read_records(ws)
     seen = {r["link"] for r in recs if r["link"]}
     new = []
+    successful = 0
     for query, location in QUERIES:
         try:
             new += process_results(run_search(query, location), seen, today)
+            successful += 1
         except Exception as e:  # keep going if one query fails
             print(f"[warn] query failed: {query!r}: {e}")
+    if not successful:
+        sys.exit("All searches failed; tracker was not changed.")
     write_records(ws, recs + new)
     if "Summary" in wb.sheetnames:
-        wb["Summary"]["B3"] = today
+        summary = wb["Summary"]
+        summary["B2"] = "Werkstudent: Data Analysis / Business Intelligence / Data Engineering"
+        summary["B3"] = today
+        summary["B4"] = "Past-week search; unknown posting dates need verification"
+        summary["B5"] = "Target cities first; then fit and newest posting"
+        summary["A8"] = "1 Target city"
+        summary["B8"] = '=COUNTIF(Jobs!B2:B1000,"1 Target city")'
+        summary["A18"] = "Target cities"
+        summary["B18"] = ", ".join(TARGET_CITIES)
+        summary["B19"] = "Fixed resume-based queries. Verify dates, language and job availability."
     wb.save(TRACKER_PATH)  # close the file in Excel before running locally
     print(f"{datetime.now():%Y-%m-%d %H:%M} - added {len(new)} new jobs "
-          f"({sum(1 for n in new if tier(n['location']) == 1)} Mumbai/Remote)")
+          f"({successful}/{len(QUERIES)} searches succeeded)")
 
 
 if __name__ == "__main__":
