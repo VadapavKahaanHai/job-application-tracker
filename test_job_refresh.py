@@ -27,6 +27,12 @@ class JobRefreshTests(unittest.TestCase):
     def test_all_city_source_role_combinations(self):
         self.assertEqual(len(set(jobs.QUERIES)), 7 * 4 * 3)
         self.assertEqual(len(jobs.TARGET_CITIES), 7)
+        for query, _ in jobs.QUERIES:
+            self.assertLessEqual(len(query), 500)
+            for skill in ("Python", "SQL", "PySpark", "PostgreSQL", "AWS", "Excel"):
+                self.assertNotIn(skill, query)
+            for keyword in ("Werkstudent", "Praktikum", "Internship"):
+                self.assertIn(keyword, query)
 
     def test_sources_and_detail_pages(self):
         urls = {
@@ -46,11 +52,21 @@ class JobRefreshTests(unittest.TestCase):
 
     def test_student_and_data_role_required(self):
         for title in ("Senior Data Analyst Hamburg", "Data Engineer Hamburg",
-                      "Werkstudent Sales Hamburg", "Intern Data Analyst Hamburg"):
+                      "Werkstudent Sales Hamburg", "International Data Analyst Hamburg",
+                      "Intern Sales Hamburg"):
             self.assertEqual(self.process(title=title), [])
         for title in ("Werkstudentin Datenanalyse Hamburg", "Working Student Data Engineering Hamburg",
                       "Werkstudent Business Intelligence Hamburg", "Werkstudent:in Power BI Hamburg"):
             self.assertEqual(len(self.process(title=title)), 1)
+
+    def test_internships_use_the_same_role_city_and_date_filters(self):
+        for title in ("Intern Data Analyst Hamburg", "Internship Business Intelligence Hamburg",
+                      "Praktikum Datenanalyse Hamburg", "Praktikant Data Engineering Hamburg",
+                      "Praktikantin Power BI Hamburg", "Pflichtpraktikum Data Analytics Hamburg"):
+            with self.subTest(title=title):
+                self.assertEqual(len(self.process(title=title)), 1)
+                self.assertEqual(self.process(title=title, description="vor 3 Tagen"), [])
+                self.assertEqual(self.process(title=title.replace("Hamburg", "Berlin")), [])
 
     def test_cities_and_aliases(self):
         for alias, city in jobs.CITIES.items():
@@ -64,9 +80,12 @@ class JobRefreshTests(unittest.TestCase):
         for text, days in (("vor 2 Tagen", 2), ("vor 1 Woche", 7), ("3 days ago", 3),
                            ("vor 4 Stunden", 0), ("gestern", 1)):
             self.assertEqual(jobs.posted_date("", text, "", self.today), self.today - timedelta(days=days))
-        for text in ("vor 8 Tagen", "2 weeks ago", "vor 1 Monat", "1 month ago"):
+        for text in ("heute", "gestern", "vor 2 Tagen", "2 days ago", "71 hours ago"):
+            self.assertEqual(len(self.process(description=text)), 1)
+        for text in ("vor 3 Tagen", "3 days ago", "72 hours ago", "vor 72 Stunden",
+                     "4320 minutes ago", "vor 4320 Minuten", "5 weeks ago", "1 month ago"):
             self.assertEqual(self.process(description=text), [])
-        self.assertIn("posting date unknown", self.process(description="Python SQL")[0]["note"])
+        self.assertEqual(self.process(description="Python SQL"), [])
 
     def test_resume_fit_and_language_flag(self):
         self.assertEqual(self.process()[0]["fit"], "High")
@@ -75,6 +94,18 @@ class JobRefreshTests(unittest.TestCase):
         self.assertIn("B1", result["note"])
         self.assertEqual(jobs.fit_of("Python SQL; German B1"), "High")
         self.assertEqual(self.process()[0]["exp"], "0-2 yrs")
+
+    def test_broader_roles_without_skills_are_kept(self):
+        for role in ("Business Analytics", "Business Analyst", "Revenue Analytics",
+                     "Marketing Analytics", "Datenanalytik", "BI Analyst", "BI Developer",
+                     "Dashboard", "Datenvisualisierung", "Reporting Analyst",
+                     "Analytics Engineering", "Data Platform", "Data Warehouse",
+                     "Datenmanagement", "Datenintegration", "Datenqualität"):
+            with self.subTest(role=role):
+                self.assertTrue(any(role in query for query in jobs.ROLE_QUERIES))
+                records = self.process(title=f"Praktikum {role} Hamburg", description="heute", markdown="")
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["fit"], "Medium")
 
     def test_duplicates_and_snippet_fallback(self):
         seen = set()
@@ -91,6 +122,9 @@ class JobRefreshTests(unittest.TestCase):
             self.assertEqual(len(jobs.run_search("query", "Hamburg, Germany")), 1)
             body = post.call_args.kwargs["json"]
             self.assertEqual(body["country"], "DE")
+            today = date.today()
+            since = today - timedelta(days=2)
+            self.assertEqual(body["tbs"], f"cdr:1,cd_min:{since:%m/%d/%Y},cd_max:{today:%m/%d/%Y}")
             self.assertEqual(body["scrapeOptions"]["formats"], [{"type": "markdown"}])
             response.json.return_value = {"success": False}
             with self.assertRaises(RuntimeError):

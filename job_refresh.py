@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Werkstudent data-role refresh for Werkstudent_Job_Tracker.xlsx.
+Werkstudent and internship data-role refresh for Werkstudent_Job_Tracker.xlsx.
 
 Priority order in the sheet:
   1 Requested German cities
@@ -10,8 +10,9 @@ Within each group: High fit first, then newest posting first.
 
 What a run does
   1. Searches and requests page content through Firecrawl for LinkedIn,
-     Hiring Cafe, XING and StepStone, limited to the past week.
-  2. Keeps student data roles in the requested cities, excluding known old jobs.
+     Hiring Cafe, XING and StepStone, limited to postings less than 3 days old.
+  2. Keeps working-student and internship data roles in the requested cities,
+     excluding known old jobs.
      Queries and skill matches are fixed from the resume; no resume is read.
   3. Adds only NEW jobs (deduplicated by link), then re-sorts the whole Jobs sheet.
      Your Status / Date Applied / Notes / Fit edits are preserved.
@@ -34,7 +35,7 @@ from openpyxl.styles import Alignment, Border, Font, Side
 API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
 TRACKER_PATH = os.environ.get("TRACKER_PATH", "Werkstudent_Job_Tracker.xlsx")
 SEARCH_URL = "https://api.firecrawl.dev/v2/search"
-MAX_AGE_DAYS = 7
+MAX_AGE_DAYS = 3
 CITIES = {
     "düsseldorf": "Düsseldorf", "duesseldorf": "Düsseldorf", "dusseldorf": "Düsseldorf",
     "köln": "Köln", "koeln": "Köln", "koln": "Köln", "cologne": "Köln",
@@ -49,27 +50,36 @@ SITES = (
     "site:xing.com/jobs",
     "site:stepstone.de/stellenangebote",
 )
-# Fixed from the resume's analytics, reporting and pipeline experience.
+# Search by role; resume skills only affect fit ratings, not search eligibility.
 ROLE_QUERIES = (
-    '("Data Analyst" OR "Data Analysis" OR "Data Analytics" OR Datenanalyse) '
-    '(Python OR SQL OR R OR Excel OR Revenue OR Marketing)',
-    '("Business Intelligence" OR "Power BI" OR Reporting) '
-    '(SQL OR "Power BI" OR Excel OR KPI)',
-    '("Data Engineering" OR "Data Engineer" OR Datenengineering) '
-    '(Python OR SQL OR PySpark OR ETL OR PostgreSQL OR AWS)',
+    '("Data Analyst" OR "Data Analysis" OR "Data Analytics" OR Datenanalyse '
+    'OR "Business Analytics" OR "Business Analyst" OR "Revenue Analytics" '
+    'OR "Marketing Analytics" OR Datenanalytik)',
+    '("Business Intelligence" OR "Power BI" OR Reporting OR "BI Analyst" '
+    'OR "BI Developer" OR Dashboard OR Datenvisualisierung OR "Reporting Analyst")',
+    '("Data Engineering" OR "Data Engineer" OR Datenengineering '
+    'OR "Analytics Engineering" OR "Data Platform" OR "Data Warehouse" '
+    'OR Datenmanagement OR Datenintegration OR Datenqualität)',
 )
 QUERIES = [
-    (f'{site} (Werkstudent OR Werkstudentin OR "Working Student") {role} "{city}"',
+    (f'{site} (Werkstudent OR Werkstudentin OR "Working Student" OR Praktikum '
+     f'OR Praktikant OR Praktikantin OR Intern OR Internship) {role} "{city}"',
      f"{city}, Germany")
     for city in TARGET_CITIES for site in SITES for role in ROLE_QUERIES
 ]
-STUDENT = re.compile(r"\b(werkstudent\w*|working\s+student|student\s+(?:employee|assistant))\b")
+STUDENT = re.compile(
+    r"\b(werkstudent\w*|working\s+student|student\s+(?:employee|assistant)|"
+    r"praktikum|pflichtpraktikum|praktikant\w*|intern|internship)\b"
+)
 NOT_RELEVANT_TITLE = re.compile(
     r"\b(senior|principal|architect|director|head of|lead|vp|vice president)\b"
 )
 MUST_MATCH = re.compile(
     r"\b(data\s+(?:analyst\w*|analys\w*|analytics|engineer\w*)|datenanalys\w*|"
-    r"datenengineering|business intelligence|bi|power\s*bi|reporting)\b"
+    r"datenengineering|business intelligence|bi|power\s*bi|reporting|"
+    r"business\s+(?:analytics|analyst\w*)|(?:revenue|marketing)\s+analytics|"
+    r"datenanalytik|dashboard\w*|datenvisualisierung|analytics\s+engineer\w*|"
+    r"data\s+(?:platform\w*|warehous\w*)|datenmanagement|datenintegration|datenqualität)\b"
 )
 RESUME_SKILLS = (
     r"python", r"sql", r"r", r"pyspark", r"pandas", r"postgresql", r"duckdb",
@@ -139,15 +149,16 @@ def posted_date(title, desc, url, today):
     if m:
         n, unit = int(m.group(1)), m.group(2)
         if unit in ("hour", "hr", "minute", "min"):
-            return today
+            return today - timedelta(days=n // (24 if unit in ("hour", "hr") else 1440))
         return today - timedelta(days=n * {"day": 1, "week": 7, "month": 30, "year": 365}[unit])
     m = re.search(r"vor\s+(\d+)\s*(minute\w*|stunde\w*|tag\w*|woche\w*|monat\w*|jahr\w*)", text)
     if m:
         n, unit = int(m.group(1)), m.group(2)
         days = n * next((factor for prefix, factor in
-                         (("tag", 1), ("woche", 7), ("monat", 30), ("jahr", 365))
+                         (("tag", 1), ("woche", 7), ("monat", 30), ("jahr", 365),
+                          ("stunde", 1 / 24), ("minute", 1 / 1440))
                          if unit.startswith(prefix)), 0)
-        return today - timedelta(days=days)
+        return today - timedelta(days=int(days))
     if re.search(r"\b(gestern|yesterday)\b", text):
         return today - timedelta(days=1)
     if re.search(r"\b(heute|today|just posted)\b", text):
@@ -216,10 +227,13 @@ def fit_of(text):
 
 # ---------- search ----------
 def run_search(query, location):
+    today = date.today()
+    since = today - timedelta(days=MAX_AGE_DAYS - 1)
     resp = requests.post(
         SEARCH_URL,
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-        json={"query": query, "limit": 20, "sources": ["web"], "tbs": "qdr:w",
+        json={"query": query, "limit": 20, "sources": ["web"],
+              "tbs": f"cdr:1,cd_min:{since:%m/%d/%Y},cd_max:{today:%m/%d/%Y}",
               "location": location, "country": "DE",
               "scrapeOptions": {"formats": [{"type": "markdown"}]}},
         timeout=90,
@@ -257,12 +271,10 @@ def process_results(results, seen_links, today):
             continue
 
         posted = posted_date(title, desc, url, today)
-        if posted and (today - posted).days > MAX_AGE_DAYS:
+        if posted is None or not 0 <= (today - posted).days < MAX_AGE_DAYS:
             continue
         exp = parse_experience(title, desc, url)
         notes = ["Auto-added; verify company, location and requirements"]
-        if not posted:
-            notes.append("posting date unknown")
         if not content:
             notes.append("page content unavailable; matched search snippet only")
         if GERMAN_ABOVE_B1.search(blob):
@@ -369,8 +381,11 @@ def main():
     successful = 0
     for query, location in QUERIES:
         try:
-            new += process_results(run_search(query, location), seen, today)
+            results = run_search(query, location)
+            added = process_results(results, seen, today)
+            new += added
             successful += 1
+            print(f"[search] {len(results)} results, {len(added)} new matches: {query}", flush=True)
         except Exception as e:  # keep going if one query fails
             print(f"[warn] query failed: {query!r}: {e}")
     if not successful:
@@ -378,9 +393,9 @@ def main():
     write_records(ws, recs + new)
     if "Summary" in wb.sheetnames:
         summary = wb["Summary"]
-        summary["B2"] = "Werkstudent: Data Analysis / Business Intelligence / Data Engineering"
+        summary["B2"] = "Werkstudent / Internship: Data Analysis / Business Intelligence / Data Engineering"
         summary["B3"] = today
-        summary["B4"] = "Past-week search; unknown posting dates need verification"
+        summary["B4"] = f"Less than {MAX_AGE_DAYS} days old; unknown posting dates excluded"
         summary["B5"] = "Target cities first; then fit and newest posting"
         summary["A8"] = "1 Target city"
         summary["B8"] = '=COUNTIF(Jobs!B2:B1000,"1 Target city")'
